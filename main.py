@@ -74,22 +74,24 @@ CS_TEAM_LEADER_DELAY   = 2.0     # CS squad leader: after ready, before start
 CS_TEAM_MEMBERS_START  = False   # CS squad members also send start_match_team (off = only the leader)
 
 # ==================== SIMPLE MOVEMENT (UDP_PLAYER_STATE_SYNC 2001) ====================
+# Positions are integer world units (~1 mm, Unity y-up), velocity is units per 100 ms,
+# stick/input fields are the zigzag-encoded world move direction scaled to length 100.
 AUTO_MOVE_ENABLED         = True
-AUTO_MOVE_START_DELAY     = 1.0               # ল্যান্ড করার পর মাত্র ১ সেকেন্ড অপেক্ষা
-AUTO_MOVE_SPAWN_TIMEOUT   = 30.0              
-AUTO_MOVE_LAND_TIMEOUT    = 5.0               
-AUTO_MOVE_TICK_INTERVAL   = 0.1               # প্রতি ১০০ মিলিসেকেন্ডে প্যাকেট পাঠাবে
-
-# --- আপনার নতুন স্পিড ও টাইমিং সেটিংস ---
-AUTO_MOVE_SPRINT_TIME     = 3.0               # একটানা ৩ সেকেন্ড স্প্রিন্ট করবে
-AUTO_MOVE_PAUSE_TIME      = 0.1               # মাত্র ০.১ সেকেন্ড দাঁড়াবে
-AUTO_MOVE_FAST_SPEED      = 1500               # অনেক ফাস্ট স্পিড (সেফটি ম্যাক্সিমাম)
-AUTO_MOVE_RADIUS          = 8000              # ম্যাপে ঘুরে বেড়ানোর পরিধি
-
-AUTO_MOVE_RESYNC_DISTANCE = 2500              
-AUTO_MOVE_PIGGYBACK_ACK   = True              
-AUTO_MOVE_MSG_KEYS        = list(range(0x64, 0x6E))  
-AUTO_MOVE_DEFAULT_RTT     = 120
+AUTO_MOVE_START_DELAY     = 1.0               # seconds after landing before the first step
+AUTO_MOVE_SPAWN_TIMEOUT   = 30.0              # log diagnostics every N s while no own state has arrived
+AUTO_MOVE_LAND_TIMEOUT    = 8.0               # start moving even if the server never reports "landed"
+AUTO_MOVE_TICK_INTERVAL   = 0.1               # seconds between 2001 packets (client sends ~10 Hz)
+AUTO_MOVE_WALK_SPEED      = 352               # units / 100 ms, physx_pose 0 (captured walk)
+AUTO_MOVE_RUN_SPEED       = 546               # units / 100 ms, physx_pose 2 (captured sprint)
+AUTO_MOVE_RUN_CHANCE      = 0.6               # probability a leg is sprinted instead of walked
+AUTO_MOVE_RADIUS          = 6000              # wander radius around the spawn point (units)
+AUTO_MOVE_MIN_LEG         = 1500              # minimum distance between waypoints (units)
+AUTO_MOVE_TURN_PER_TICK   = 25.0              # max heading change per tick (degrees)
+AUTO_MOVE_PAUSE_RANGE     = (0.0, 0.1)        # idle seconds at each waypoint
+AUTO_MOVE_RESYNC_DISTANCE = 2500              # server pos this far from every recent sent pos -> resync
+AUTO_MOVE_PIGGYBACK_ACK   = True              # ack reliable server packets inside 2001 (flags=4)
+AUTO_MOVE_MSG_KEYS        = list(range(0x64, 0x6E))  # msg keys seen on captured 2001 packets
+AUTO_MOVE_DEFAULT_RTT     = 120               # ms reported in the net-tick field until measured
 
 # ==================== ANTI-AFK MOVEMENT (legacy) ====================
 # Only used when AUTO_MOVE_ENABLED is False (both send 2001 packets, never run them together)
@@ -1160,7 +1162,8 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
         except asyncio.TimeoutError:
             return False
 
-    # স্পন হওয়া এবং মাটিতে ল্যান্ড করার জন্য অপেক্ষা
+    # Wait for the server to report our slot/position, then for landing (physx_state 1 = falling).
+    # Keep waiting for the whole match: loading can take longer than the timeout.
     next_report = time.time() + AUTO_MOVE_SPAWN_TIMEOUT
     landed_deadline = None
     while True:
@@ -1170,7 +1173,7 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
             if (state.server_physx_state == 0 and state.server_vel_y == 0) or time.time() > landed_deadline:
                 break
         elif time.time() > next_report:
-            print_warning(f"[MOVE]{label} Waiting for own-state 2001: {state.diagnostics()}")
+            print_warning(f"[MOVE]{label} Still waiting for own-state 2001: {state.diagnostics()}")
             next_report = time.time() + AUTO_MOVE_SPAWN_TIMEOUT
         if await wait(0.2):
             return
@@ -1180,78 +1183,73 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
     pos = list(state.server_pos)
     anchor = tuple(pos)
     seen_seq = state.server_update_seq
-    heading = random.uniform(-math.pi, math.pi)
-    
-    # ৩ সেকেন্ড স্প্রিন্ট ও ০.১ সেকেন্ড বিরতি লুপের স্টেট
-    is_sprinting = True
-    state_end_time = time.time() + AUTO_MOVE_SPRINT_TIME
+    heading = random.uniform(-math.pi, math.pi)     # yaw, atan2(x, z)
+    stick = (math.sin(heading) * 100, 0.0, math.cos(heading) * 100)
+    target = None
+    speed = 0
+    pause_until = time.time() + random.uniform(*AUTO_MOVE_PAUSE_RANGE)
     recent_sent = collections.deque(maxlen=40)
     last_send = time.time()
-    
-    print_premium(f"[MOVE]{label} Fast Sprint Started! (3s Sprint / 0.1s Pause | Speed: {AUTO_MOVE_FAST_SPEED})",
-                  color=PX.LIME, icon=I["rocket"])
+    print_info(f"[MOVE]{label} Auto move started (slot {state.slot}, spawn {anchor})")
 
     while not stop_event.is_set():
         now = time.time()
         dt_ms = (now - last_send) * 1000.0
         last_send = now
 
-        # সার্ভার রিসিঙ্ক বা টেলিপোর্ট হ্যান্ডলিং
+        # Respawn / teleport / server correction: the echoed position matches nothing we sent.
         if state.server_update_seq != seen_seq and state.server_pos:
             seen_seq = state.server_update_seq
             sx, sy, sz = state.server_pos
-            if recent_sent and all(math.hypot(sx - p[0], sz - p[2]) > AUTO_MOVE_RESYNC_DISTANCE for p in recent_sent):
-                print_info(f"[MOVE]{label} Server resync pos -> {state.server_pos}")
+            if recent_sent and all(math.hypot(sx - p[0], sz - p[2]) > AUTO_MOVE_RESYNC_DISTANCE
+                                   for p in recent_sent):
+                print_info(f"[MOVE]{label} Server moved us to {state.server_pos} -> resync")
                 pos = [sx, sy, sz]
                 anchor = (sx, sy, sz)
+                target = None
                 recent_sent.clear()
-                is_sprinting = False
-                state_end_time = now + AUTO_MOVE_PAUSE_TIME
+                pause_until = now + random.uniform(*AUTO_MOVE_PAUSE_RANGE)
 
-        # ৩ সেকেন্ড স্প্রিন্ট এবং ০.১ সেকেন্ড বিরতির টাইমার ট্র্যাকিং
-        if is_sprinting:
-            if now >= state_end_time:
-                # ৩ সেকেন্ড শেষ -> ০.১ সেকেন্ডের জন্য দাঁড়াবে
-                is_sprinting = False
-                state_end_time = now + AUTO_MOVE_PAUSE_TIME
-        else:
-            if now >= state_end_time:
-                # ০.১ সেকেন্ড দাঁড়ানো শেষ -> নতুন ডিরেকশনে ৩ সেকেন্ড ফাস্ট স্প্রিন্ট শুরু
-                is_sprinting = True
-                state_end_time = now + AUTO_MOVE_SPRINT_TIME
-                
-                # ম্যাপের বাইরে চলে গেলে স্পন সেন্টারের দিকে মুখ ঘোরানো
-                dx = anchor[0] - pos[0]
-                dz = anchor[2] - pos[2]
-                if math.hypot(dx, dz) > AUTO_MOVE_RADIUS:
-                    heading = math.atan2(dx, dz) + random.uniform(-0.4, 0.4)
-                else:
-                    heading = random.uniform(-math.pi, math.pi)
+        if target is None and now >= pause_until:
+            for _ in range(10):
+                ang = random.uniform(-math.pi, math.pi)
+                dist = random.uniform(0, AUTO_MOVE_RADIUS)
+                cand = (anchor[0] + math.sin(ang) * dist, anchor[2] + math.cos(ang) * dist)
+                if math.hypot(cand[0] - pos[0], cand[1] - pos[2]) >= AUTO_MOVE_MIN_LEG:
+                    break
+            target = cand
+            run = random.random() < AUTO_MOVE_RUN_CHANCE
+            speed = AUTO_MOVE_RUN_SPEED if run else AUTO_MOVE_WALK_SPEED
 
-        # স্প্রিন্ট বনাম দাঁড়ানোর পজিশন ক্যালকুলেশন
-        if is_sprinting:
-            speed = AUTO_MOVE_FAST_SPEED
-            step = (speed * 1.15) * dt_ms / 100.0
-            ux, uz = math.sin(heading), math.cos(heading)
-            stick = (ux * 100, 0.0, uz * 100)
-            move_input = (stick[0], stick[2])
-            vel = (ux * speed, 0, uz * speed)
-            pose = 2  # স্প্রিন্ট পোজ
-            pos[0] += ux * step
-            pos[2] += uz * step
-        else:
-            speed = 0
-            stick = (0.0, 0.0, 0.0)
-            move_input = (0, 0)
-            vel = (0, 0, 0)
-            pose = 0  # স্ট্যান্ডিং/আইডল পোজ
+        move_input = (0, 0)
+        vel = (0, 0, 0)
+        pose = 0
+        if target is not None:
+            dx, dz = target[0] - pos[0], target[1] - pos[2]
+            remaining = math.hypot(dx, dz)
+            step = speed * dt_ms / 100.0
+            if remaining <= step:
+                pos[0], pos[2] = target
+                target = None
+                pause_until = now + random.uniform(*AUTO_MOVE_PAUSE_RANGE)
+            else:
+                want = math.atan2(dx, dz)
+                diff = (want - heading + math.pi) % (2 * math.pi) - math.pi
+                max_turn = math.radians(AUTO_MOVE_TURN_PER_TICK)
+                heading += max(-max_turn, min(max_turn, diff))
+                ux, uz = math.sin(heading), math.cos(heading)
+                stick = (ux * 100, 0.0, uz * 100)
+                move_input = (stick[0], stick[2])
+                vel = (ux * speed, 0, uz * speed)
+                pose = 2 if speed >= AUTO_MOVE_RUN_SPEED else 0
+                pos[0] += ux * step
+                pos[2] += uz * step
 
         facing = (math.sin(heading), 0.0, math.cos(heading))
         rtt = state.rtt_ms if state.rtt_ms is not None else AUTO_MOVE_DEFAULT_RTT
         ack = None
         if AUTO_MOVE_PIGGYBACK_ACK and state.pending_ack is not None:
             ack, state.pending_ack = state.pending_ack, None
-
         try:
             pkt = await build_player_state_sync_2001(
                 key_bytes, mask, random.choice(AUTO_MOVE_MSG_KEYS), state.slot,
@@ -1259,11 +1257,9 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
                 max(1, min(1000, rtt)), int((now - state.session_start) * 1000), ack_order=ack
             )
             await loop.sock_sendto(sock, pkt, (ip, port))
-            if is_sprinting:
-                recent_sent.append((round(pos[0]), round(pos[1]), round(pos[2])))
+            recent_sent.append((round(pos[0]), round(pos[1]), round(pos[2])))
         except Exception as e:
             print_warning(f"[MOVE]{label} send error: {e}")
-
         if await wait(AUTO_MOVE_TICK_INTERVAL):
             return
 
